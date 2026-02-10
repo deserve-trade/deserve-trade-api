@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import { renderer } from "./renderer";
 import { authRoutes } from "./routes/auth";
+import { agentRoutes } from "./routes/agents";
 import type { Bindings } from "./types/env";
 
 const app = new Hono<{ Bindings: Bindings }>();
@@ -35,6 +36,7 @@ app.use("*", async (c, next) => {
 
 app.use(renderer);
 app.route("/auth", authRoutes);
+app.route("/agents", agentRoutes);
 
 app.get("/", (c) => {
   return c.render(<h1>Hello!</h1>);

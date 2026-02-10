@@ -3,6 +3,8 @@ export type Bindings = {
   APP_ORIGIN?: string;
   APP_DOMAIN?: string;
   COOKIE_DOMAIN?: string;
+  CORE_URL?: string;
+  CORE_API_TOKEN?: string;
   SUPABASE_URL: string;
   SUPABASE_SERVICE_ROLE_KEY: string;
 };
