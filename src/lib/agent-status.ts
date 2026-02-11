@@ -4,6 +4,7 @@ export const AgentStatus = {
   AwaitingRedirect: "Awaiting Redirect Url",
   AwaitingGateway: "Awaiting Gateway",
   AgentWarmup: "Agent Warmup",
+  PreparingTradingAccount: "Preparing Trading Account",
   StrategyBuilding: "Strategy Building",
   TradingWalletGenerating: "Trading Wallet Generating",
   AwaitingDeposit: "Awaiting Deposit",
@@ -20,6 +21,7 @@ const legacyMap: Record<string, AgentStatusValue> = {
   verifying: AgentStatus.Onboarding,
   ready: AgentStatus.StrategyBuilding,
   failed: AgentStatus.Cancelled,
+  "trading wallet generating": AgentStatus.PreparingTradingAccount,
 };
 
 export function normalizeAgentStatus(status?: string | null): AgentStatusValue {
@@ -37,6 +39,7 @@ export const ActiveAgentStatuses: AgentStatusValue[] = [
   AgentStatus.AwaitingRedirect,
   AgentStatus.AwaitingGateway,
   AgentStatus.AgentWarmup,
+  AgentStatus.PreparingTradingAccount,
   AgentStatus.StrategyBuilding,
   AgentStatus.TradingWalletGenerating,
   AgentStatus.AwaitingDeposit,

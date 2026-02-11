@@ -12,6 +12,7 @@ import type { Bindings } from "../types/env";
 
 const ONBOARDING_TIMEOUT_MS = 5 * 60 * 1000;
 const STRATEGY_TIMEOUT_MS = 60 * 60 * 1000;
+const DEPOSIT_TIMEOUT_MS = 60 * 60 * 1000;
 
 function statusTimeoutMs(status: AgentStatusValue) {
   if (
@@ -23,6 +24,9 @@ function statusTimeoutMs(status: AgentStatusValue) {
   }
   if (status === AgentStatus.StrategyBuilding) {
     return STRATEGY_TIMEOUT_MS;
+  }
+  if (status === AgentStatus.AwaitingDeposit) {
+    return DEPOSIT_TIMEOUT_MS;
   }
   return null;
 }
@@ -49,6 +53,7 @@ async function upsertAgentRecord({
   userId,
   status,
   sessionId,
+  network,
   lastError,
 }: {
   env: Bindings;
@@ -56,10 +61,13 @@ async function upsertAgentRecord({
   userId: string;
   status: AgentStatusValue;
   sessionId: string;
+  network?: string | null;
   lastError?: string | null;
 }) {
   const supabase = getSupabaseClient(env);
   const now = new Date().toISOString();
+  const normalizedNetwork =
+    String(network || "").toLowerCase() === "mainnet" ? "mainnet" : "testnet";
   const { error } = await supabase
     .from("agents")
     .upsert(
@@ -68,6 +76,7 @@ async function upsertAgentRecord({
         user_id: userId,
         status,
         session_id: sessionId,
+        network: normalizedNetwork,
         status_updated_at: now,
         updated_at: now,
         last_error: lastError ?? null,
@@ -85,6 +94,7 @@ async function updateAgentStatus({
   userId,
   status,
   sessionId,
+  network,
   lastError,
 }: {
   env: Bindings;
@@ -92,6 +102,7 @@ async function updateAgentStatus({
   userId?: string | null;
   status: AgentStatusValue;
   sessionId?: string | null;
+  network?: string | null;
   lastError?: string | null;
 }) {
   const supabase = getSupabaseClient(env);
@@ -103,6 +114,9 @@ async function updateAgentStatus({
   };
   if (typeof lastError !== "undefined") update.last_error = lastError;
   if (sessionId) update.session_id = sessionId;
+  if (typeof network !== "undefined") {
+    update.network = String(network || "").toLowerCase() === "mainnet" ? "mainnet" : "testnet";
+  }
   let query = supabase.from("agents").update(update).eq("id", id);
   if (userId) query = query.eq("user_id", userId);
   const { data, error } = await query.select("id").maybeSingle();
@@ -116,6 +130,7 @@ async function updateAgentStatus({
       userId,
       status,
       sessionId,
+      network,
       lastError,
     });
   }
@@ -230,7 +245,7 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     const { data, error } = await supabase
       .from("agents")
       .select(
-        "id, status, session_id, created_at, updated_at, status_updated_at, last_error"
+        "id, status, session_id, network, created_at, updated_at, status_updated_at, last_error"
       )
       .eq("user_id", String(session.sub))
       .order("created_at", { ascending: false });
@@ -256,11 +271,12 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
           return {
             ...row,
             status: AgentStatus.Cancelled,
+            network: row.network || "testnet",
             status_updated_at: now,
             last_error: row.last_error ?? "timeout",
           };
         }
-        return { ...row, status: normalized };
+        return { ...row, status: normalized, network: row.network || "testnet" };
       })
     );
 
@@ -275,7 +291,7 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     const { data, error } = await supabase
       .from("agents")
       .select(
-        "id, user_id, status, session_id, created_at, updated_at, status_updated_at"
+        "id, user_id, status, session_id, network, created_at, updated_at, status_updated_at"
       );
 
     if (error) {
@@ -301,7 +317,12 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
           });
           return null;
         }
-        return { ...row, status: normalized, status_updated_at: row.status_updated_at ?? now };
+        return {
+          ...row,
+          status: normalized,
+          network: row.network || "testnet",
+          status_updated_at: row.status_updated_at ?? now,
+        };
       })
     );
 
@@ -338,9 +359,13 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
           userId: String(session.sub),
           status: normalized,
           sessionId: data.sessionId,
+          network: data.network,
         });
       }
       data.status = normalized;
+      data.network = String(data.network || "testnet").toLowerCase() === "mainnet"
+        ? "mainnet"
+        : "testnet";
     }
     return c.json(data, response.status);
   })
@@ -359,6 +384,7 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
       userId: payload.userId ?? null,
       status: normalized,
       sessionId: payload.sessionId ?? null,
+      network: payload.network ?? null,
       lastError: payload.lastError ?? null,
     });
     return c.json({ ok: true, status: normalized });
@@ -371,7 +397,9 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     const supabase = getSupabaseClient(c.env);
     const { data: bySession, error: sessionError } = await supabase
       .from("agents")
-      .select("id, session_id, status, status_updated_at, updated_at, created_at, last_error")
+      .select(
+        "id, session_id, status, network, status_updated_at, updated_at, created_at, last_error"
+      )
       .eq("session_id", lookupId)
       .eq("user_id", String(session.sub))
       .maybeSingle();
@@ -383,7 +411,9 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     if (!agentRow) {
       const { data: byAgent, error: agentError } = await supabase
         .from("agents")
-        .select("id, session_id, status, status_updated_at, updated_at, created_at, last_error")
+        .select(
+          "id, session_id, status, network, status_updated_at, updated_at, created_at, last_error"
+        )
         .eq("id", lookupId)
         .eq("user_id", String(session.sub))
         .maybeSingle();
@@ -410,6 +440,10 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
       const agentId = data.agentId ?? agentRow.id;
       data.agentId = agentId;
       data.sessionId = sessionId;
+      data.network =
+        String(data.network || agentRow.network || "testnet").toLowerCase() === "mainnet"
+          ? "mainnet"
+          : "testnet";
       data.statusUpdatedAt =
         agentRow.status_updated_at ?? agentRow.updated_at ?? agentRow.created_at ?? null;
       const previousStatus = normalizeAgentStatus(agentRow.status);
@@ -421,6 +455,7 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
             userId: String(session.sub),
             status: normalized,
             sessionId,
+            network: data.network,
             lastError: data.error ?? null,
           });
         }
@@ -450,6 +485,112 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     }
 
     return c.json({ messages: data ?? [] });
+  })
+  .get("/:id/public", async (c) => {
+    const agentId = c.req.param("id");
+    const supabase = getSupabaseClient(c.env);
+    const { data: agentRow, error: agentError } = await supabase
+      .from("agents")
+      .select(
+        "id, user_id, status, network, initial_deposit_usd, live_started_at, created_at, updated_at, status_updated_at"
+      )
+      .eq("id", agentId)
+      .maybeSingle();
+    if (agentError) {
+      return c.json({ error: "Failed to load agent." }, 500);
+    }
+    if (!agentRow) return c.json({ error: "Agent not found" }, 404);
+    const status = normalizeAgentStatus(agentRow.status);
+
+    const { data: userRow } = await supabase
+      .from("users")
+      .select("wallet_address")
+      .eq("id", agentRow.user_id)
+      .maybeSingle();
+
+    const { data: walletRow } = await supabase
+      .from("agent_wallets")
+      .select("public_address, exchange")
+      .eq("agent_id", agentId)
+      .eq("exchange", "hyperliquid")
+      .eq("role", "master")
+      .maybeSingle();
+
+    return c.json({
+      agent: {
+        id: agentRow.id,
+        status,
+        network: String(agentRow.network || "testnet").toLowerCase() === "mainnet"
+          ? "mainnet"
+          : "testnet",
+        authorWalletAddress: userRow?.wallet_address ?? null,
+        initialDepositUsd:
+          agentRow.initial_deposit_usd === null ||
+          typeof agentRow.initial_deposit_usd === "undefined"
+            ? null
+            : Number(agentRow.initial_deposit_usd),
+        liveStartedAt: agentRow.live_started_at ?? null,
+        createdAt: agentRow.created_at ?? null,
+        statusUpdatedAt:
+          agentRow.status_updated_at ?? agentRow.updated_at ?? agentRow.created_at ?? null,
+        depositAddress: walletRow?.public_address ?? null,
+      },
+    });
+  })
+  .get("/:id/public-logs", async (c) => {
+    const agentId = c.req.param("id");
+    const supabase = getSupabaseClient(c.env);
+    const { data, error } = await supabase
+      .from("agent_public_logs")
+      .select("message, kind, created_at")
+      .eq("agent_id", agentId)
+      .order("created_at", { ascending: true })
+      .limit(500);
+    if (error) {
+      return c.json({ error: "Failed to load logs." }, 500);
+    }
+    return c.json({ logs: data ?? [] });
+  })
+  .post("/:id/confirm", async (c) => {
+    const { session, reason } = await requireSession(c);
+    if (!session) return c.json({ error: "Unauthorized", reason }, 401);
+
+    const agentId = c.req.param("id");
+    const userId = String(session.sub);
+    const ownsAgent = await ensureAgentOwnership(c.env, userId, agentId);
+    if (!ownsAgent) return c.json({ error: "Agent not found" }, 404);
+
+    const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
+    if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
+
+    const response = await fetch(`${coreUrl}/agents/${agentId}/confirm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return c.json(
+        { error: data?.error || "Failed to confirm strategy." },
+        response.status
+      );
+    }
+
+    if (data?.status) {
+      const normalized = normalizeAgentStatus(data.status);
+      await updateAgentStatus({
+        env: c.env,
+        id: agentId,
+        userId,
+        status: normalized,
+        sessionId: data.sessionId ?? null,
+        network: data.network ?? null,
+        lastError: data.error ?? null,
+      });
+      data.status = normalized;
+    }
+
+    return c.json(data);
   })
   .delete("/:id", async (c) => {
     const { session, reason } = await requireSession(c);
@@ -503,6 +644,51 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     return c.json({ ok: true });
   })
+  .post("/:id/withdraw", async (c) => {
+    const { session, reason } = await requireSession(c);
+    if (!session) return c.json({ error: "Unauthorized", reason }, 401);
+
+    const agentId = c.req.param("id");
+    const userId = String(session.sub);
+    const payload = await c.req.json().catch(() => ({}));
+    const destination = String(payload?.destination || "").trim();
+    if (!destination) {
+      return c.json({ error: "destination is required" }, 400);
+    }
+
+    const supabase = getSupabaseClient(c.env);
+    const { data: agentRow, error: agentError } = await supabase
+      .from("agents")
+      .select("id, status")
+      .eq("id", agentId)
+      .eq("user_id", userId)
+      .maybeSingle();
+
+    if (agentError) {
+      return c.json({ error: "Failed to load agent." }, 500);
+    }
+    if (!agentRow) return c.json({ error: "Agent not found" }, 404);
+
+    const status = normalizeAgentStatus(agentRow.status);
+    if (status !== AgentStatus.Stopped) {
+      return c.json({ error: "Withdrawals are only available when stopped." }, 409);
+    }
+
+    const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
+    if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
+
+    const response = await fetch(`${coreUrl}/agents/${agentId}/withdraw`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ userId, destination }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return c.json({ error: data?.error || "Failed to withdraw." }, response.status);
+    }
+
+    return c.json(data);
+  })
   .post("/:id/submit", async (c) => {
     const { session, reason } = await requireSession(c);
     if (!session) return c.json({ error: "Unauthorized", reason }, 401);
@@ -527,6 +713,23 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     const userId = String(session.sub);
     const ownsAgent = await ensureAgentOwnership(c.env, userId, agentId);
     if (!ownsAgent) return c.json({ error: "Agent not found" }, 404);
+    const supabase = getSupabaseClient(c.env);
+    const { data: agentRow, error: agentError } = await supabase
+      .from("agents")
+      .select("status")
+      .eq("id", agentId)
+      .eq("user_id", userId)
+      .maybeSingle();
+    if (agentError) {
+      return c.json({ error: "Failed to load agent." }, 500);
+    }
+    if (!agentRow) return c.json({ error: "Agent not found" }, 404);
+    if (normalizeAgentStatus(agentRow.status) !== AgentStatus.StrategyBuilding) {
+      return c.json(
+        { error: "Chat is read-only after strategy confirmation." },
+        409
+      );
+    }
 
     const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
     if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
