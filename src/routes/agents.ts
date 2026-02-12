@@ -392,7 +392,7 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     const { data, error } = await supabase
       .from("agents")
       .select(
-        "id, name, status, session_id, network, created_at, updated_at, status_updated_at, last_error"
+        "id, name, status, session_id, network, created_at, updated_at, status_updated_at, live_started_at, initial_deposit_usd, current_balance_usd, current_balance_updated_at, last_error"
       )
       .eq("user_id", String(session.sub))
       .order("created_at", { ascending: false });
@@ -401,12 +401,51 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
       return c.json({ error: "Failed to load agents." }, 500);
     }
 
-    const now = new Date().toISOString();
+    const nowIso = new Date().toISOString();
     const agents = await Promise.all(
       (data ?? []).map(async (row) => {
         const normalized = normalizeAgentStatus(row.status);
         const timestamp =
           row.status_updated_at ?? row.updated_at ?? row.created_at ?? null;
+        const initialDepositUsd =
+          row.initial_deposit_usd === null ||
+          typeof row.initial_deposit_usd === "undefined"
+            ? null
+            : Number(row.initial_deposit_usd);
+        const currentBalanceUsd =
+          row.current_balance_usd === null ||
+          typeof row.current_balance_usd === "undefined"
+            ? null
+            : Number(row.current_balance_usd);
+        const hasPnlInputs =
+          typeof initialDepositUsd === "number" &&
+          Number.isFinite(initialDepositUsd) &&
+          typeof currentBalanceUsd === "number" &&
+          Number.isFinite(currentBalanceUsd);
+        const pnlUsd =
+          hasPnlInputs
+            ? Number((currentBalanceUsd - initialDepositUsd).toFixed(6))
+            : null;
+        const pnlPercent =
+          hasPnlInputs && initialDepositUsd > 0
+            ? Number(
+                (
+                  ((currentBalanceUsd - initialDepositUsd) / initialDepositUsd) *
+                  100
+                ).toFixed(6)
+              )
+            : null;
+
+        const baseRow = {
+          ...row,
+          status: normalized,
+          network: row.network || "testnet",
+          initial_deposit_usd: initialDepositUsd,
+          current_balance_usd: currentBalanceUsd,
+          pnl_usd: pnlUsd,
+          pnl_percent: pnlPercent,
+        };
+
         if (hasExpiredStatus(normalized, timestamp)) {
           await updateAgentStatus({
             env: c.env,
@@ -416,14 +455,14 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
             lastError: row.last_error ?? "timeout",
           });
           return {
-            ...row,
+            ...baseRow,
             status: AgentStatus.Cancelled,
-            network: row.network || "testnet",
-            status_updated_at: now,
+            status_updated_at: nowIso,
             last_error: row.last_error ?? "timeout",
           };
         }
-        return { ...row, status: normalized, network: row.network || "testnet" };
+
+        return baseRow;
       })
     );
 
@@ -773,7 +812,7 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     const { data: agentRow, error: agentError } = await supabase
       .from("agents")
       .select(
-        "id, name, user_id, status, network, initial_deposit_usd, current_balance_usd, current_balance_updated_at, live_started_at, created_at, updated_at, status_updated_at"
+        "id, name, user_id, status, network, initial_deposit_usd, current_balance_usd, current_balance_updated_at, ai_credits_remaining_percent, ai_credits_resets_in, ai_credits_updated_at, live_started_at, created_at, updated_at, status_updated_at"
       )
       .eq("id", agentId)
       .maybeSingle();
@@ -838,6 +877,17 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
         pnlUsd,
         pnlPercent,
         currentBalanceUpdatedAt: agentRow.current_balance_updated_at ?? null,
+        aiCreditsRemainingPercent:
+          agentRow.ai_credits_remaining_percent === null ||
+          typeof agentRow.ai_credits_remaining_percent === "undefined"
+            ? null
+            : Number(agentRow.ai_credits_remaining_percent),
+        aiCreditsResetsIn:
+          typeof agentRow.ai_credits_resets_in === "string" &&
+          agentRow.ai_credits_resets_in.trim()
+            ? agentRow.ai_credits_resets_in.trim()
+            : null,
+        aiCreditsUpdatedAt: agentRow.ai_credits_updated_at ?? null,
         liveStartedAt: agentRow.live_started_at ?? null,
         createdAt: agentRow.created_at ?? null,
         statusUpdatedAt:
