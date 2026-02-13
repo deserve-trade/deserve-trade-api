@@ -5,5 +5,19 @@
   "main": "./src/index.tsx",
   "dev": {
     "port": 8787
+  },
+  "routes": [
+    {
+      "pattern": "api.deserve.trade",
+      "custom_domain": true
+    }
+  ],
+  "observability": {
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "invocation_logs": true,
+      "persist": true
+    }
   }
 }

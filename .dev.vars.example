@@ -5,3 +5,5 @@ APP_ORIGIN=http://localhost:5173
 APP_DOMAIN=http://localhost:5173
 COOKIE_DOMAIN=
 CORE_URL=http://localhost:8788
+CORE_SERVICE_TOKEN=tWSDUUNTmuAewqrWhGHQycQyySX5Jn65ukCcFbkRHTY=
+SOLANA_RPC_URL=https://mainnet.helius-rpc.com/?api-key=ec34e8c9-2525-4ec6-8e6d-3d652e4d81c5

@@ -16,6 +16,11 @@ const DEPOSIT_TIMEOUT_MS = 60 * 60 * 1000;
 const AGENT_NAME_MAX_LEN = 64;
 const DEFAULT_MAX_AGENTS_PER_USER = 1;
 const MAX_AGENTS_PER_USER_SETTING_KEY = "max_agents_per_user";
+const AGENT_CREATION_TOKEN_MINT_SETTING_KEY = "agent_creation_token_mint";
+const AGENT_CREATION_TOKEN_MIN_AMOUNT_SETTING_KEY =
+  "agent_creation_token_min_amount";
+const DEFAULT_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com";
+const ELIGIBILITY_EPSILON = 1e-9;
 
 function statusTimeoutMs(status: AgentStatusValue) {
   if (
@@ -49,12 +54,40 @@ function parsePositiveInteger(value: unknown) {
   return parsed;
 }
 
-function coreTokenAllowed(c: Parameters<typeof agentRoutes.use>[0]) {
-  if (!c.env.CORE_API_TOKEN) return true;
+function parseNonNegativeNumber(value: unknown) {
+  const parsed = Number(String(value ?? "").trim());
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed < 0) return null;
+  return parsed;
+}
+
+function getCoreServiceToken(env: Bindings) {
+  const token = String(env.CORE_SERVICE_TOKEN || env.CORE_API_TOKEN || "").trim();
+  return token.length > 0 ? token : null;
+}
+
+function coreTokenAllowed(c: { env: Bindings; req: { header(name: string): string | undefined } }) {
+  const expectedToken = getCoreServiceToken(c.env);
+  if (!expectedToken) return false;
   const headerToken =
     c.req.header("x-core-token") ??
     c.req.header("authorization")?.replace(/^Bearer\s+/i, "");
-  return Boolean(headerToken && headerToken === c.env.CORE_API_TOKEN);
+  return Boolean(headerToken && headerToken === expectedToken);
+}
+
+function buildCoreHeaders(
+  env: Bindings,
+  options: { json?: boolean } = {}
+) {
+  const token = getCoreServiceToken(env);
+  if (!token) return null;
+  const headers: Record<string, string> = {
+    "x-core-token": token,
+  };
+  if (options.json !== false) {
+    headers["Content-Type"] = "application/json";
+  }
+  return headers;
 }
 
 function normalizeProposedAgentName(value: unknown) {
@@ -155,6 +188,193 @@ async function getMaxAgentsPerUserSetting(env: Bindings) {
   return (
     parsePositiveInteger(data?.value_text) ?? DEFAULT_MAX_AGENTS_PER_USER
   );
+}
+
+async function getAgentCreationTokenGateSettings(env: Bindings) {
+  const supabase = getSupabaseClient(env);
+  const { data, error } = await supabase
+    .from("app_settings")
+    .select("key, value_text")
+    .in("key", [
+      AGENT_CREATION_TOKEN_MINT_SETTING_KEY,
+      AGENT_CREATION_TOKEN_MIN_AMOUNT_SETTING_KEY,
+    ]);
+
+  if (error) {
+    console.warn("[agents] failed to read token gate settings", error);
+    return {
+      mint: null as string | null,
+      requiredAmount: 0,
+    };
+  }
+
+  const settings = new Map(
+    (data ?? []).map((row) => [String(row.key), String(row.value_text ?? "")])
+  );
+  const mintRaw = settings.get(AGENT_CREATION_TOKEN_MINT_SETTING_KEY) ?? "";
+  const mint = mintRaw.trim();
+  const minAmountRaw =
+    settings.get(AGENT_CREATION_TOKEN_MIN_AMOUNT_SETTING_KEY) ?? "0";
+  const requiredAmount = parseNonNegativeNumber(minAmountRaw) ?? 0;
+
+  return {
+    mint: mint.length > 0 ? mint : null,
+    requiredAmount,
+  };
+}
+
+async function fetchSplTokenBalanceByMint({
+  env,
+  walletAddress,
+  mint,
+}: {
+  env: Bindings;
+  walletAddress: string;
+  mint: string;
+}) {
+  const rpcUrl = (env.SOLANA_RPC_URL || "").trim() || DEFAULT_SOLANA_RPC_URL;
+  const response = await fetch(rpcUrl, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: "agent-creation-token-check",
+      method: "getTokenAccountsByOwner",
+      params: [
+        walletAddress,
+        { mint },
+        {
+          encoding: "jsonParsed",
+        },
+      ],
+    }),
+  });
+
+  const payload = (await response.json().catch(() => null)) as
+    | {
+        error?: { message?: string };
+        result?: {
+          value?: Array<{
+            account?: {
+              data?: {
+                parsed?: {
+                  info?: {
+                    tokenAmount?: {
+                      uiAmountString?: string;
+                      uiAmount?: number;
+                    };
+                  };
+                };
+              };
+            };
+          }>;
+        };
+      }
+    | null;
+
+  if (!response.ok) {
+    throw new Error(`RPC request failed with status ${response.status}`);
+  }
+  if (payload?.error) {
+    throw new Error(payload.error.message || "RPC returned an error");
+  }
+
+  let total = 0;
+  for (const item of payload?.result?.value ?? []) {
+    const tokenAmount = item?.account?.data?.parsed?.info?.tokenAmount;
+    const asString = tokenAmount?.uiAmountString;
+    const parsed = Number(
+      typeof asString === "string" && asString.length > 0
+        ? asString
+        : tokenAmount?.uiAmount ?? 0
+    );
+    if (Number.isFinite(parsed) && parsed > 0) {
+      total += parsed;
+    }
+  }
+
+  return Number(total.toFixed(9));
+}
+
+async function evaluateAgentCreationEligibility({
+  env,
+  walletAddress,
+}: {
+  env: Bindings;
+  walletAddress?: string | null;
+}) {
+  const settings = await getAgentCreationTokenGateSettings(env);
+  if (!settings.mint) {
+    return {
+      enabled: true,
+      eligible: false,
+      mint: null,
+      requiredAmount: settings.requiredAmount,
+      currentAmount: null as number | null,
+      reason:
+        "Agent creation is paused and will be enabled right after the DSRV token is minted.",
+      code: "TOKEN_GATE_MINT_NOT_CONFIGURED",
+    };
+  }
+
+  if (settings.requiredAmount <= 0) {
+    return {
+      enabled: false,
+      eligible: true,
+      mint: settings.mint,
+      requiredAmount: settings.requiredAmount,
+      currentAmount: null as number | null,
+      reason: null as string | null,
+      code: null as string | null,
+    };
+  }
+
+  const owner = String(walletAddress || "").trim();
+  if (!owner) {
+    return {
+      enabled: true,
+      eligible: false,
+      mint: settings.mint,
+      requiredAmount: settings.requiredAmount,
+      currentAmount: null,
+      reason: "Wallet address is missing for token-gated agent creation.",
+      code: "TOKEN_GATE_WALLET_MISSING",
+    };
+  }
+
+  try {
+    const currentAmount = await fetchSplTokenBalanceByMint({
+      env,
+      walletAddress: owner,
+      mint: settings.mint,
+    });
+    const eligible =
+      currentAmount + ELIGIBILITY_EPSILON >= settings.requiredAmount;
+    return {
+      enabled: true,
+      eligible,
+      mint: settings.mint,
+      requiredAmount: settings.requiredAmount,
+      currentAmount,
+      reason: eligible
+        ? null
+        : `Insufficient DSRV balance. Required ${settings.requiredAmount}, current ${currentAmount}.`,
+      code: eligible ? null : "TOKEN_GATE_INSUFFICIENT_BALANCE",
+    };
+  } catch (error) {
+    const message =
+      error instanceof Error ? error.message : "Unknown balance check error";
+    console.warn("[agents] token gate balance check failed", { message });
+    return {
+      enabled: true,
+      eligible: false,
+      mint: settings.mint,
+      requiredAmount: settings.requiredAmount,
+      currentAmount: null,
+      reason: "Unable to verify DSRV balance right now. Please try again.",
+      code: "TOKEN_GATE_CHECK_FAILED",
+    };
+  }
 }
 
 async function getActiveAgentCountForLimit({
@@ -468,6 +688,28 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     return c.json({ agents });
   })
+  .get("/creation-eligibility", async (c) => {
+    const { session, reason } = await requireSession(c);
+    if (!session) return c.json({ error: "Unauthorized", reason }, 401);
+
+    const eligibility = await evaluateAgentCreationEligibility({
+      env: c.env,
+      walletAddress:
+        typeof session.walletAddress === "string" ? session.walletAddress : null,
+    });
+
+    return c.json({
+      eligibility: {
+        enabled: eligibility.enabled,
+        eligible: eligibility.eligible,
+        mint: eligibility.mint,
+        requiredAmount: eligibility.requiredAmount,
+        currentAmount: eligibility.currentAmount,
+        reason: eligibility.reason,
+        code: eligibility.code,
+      },
+    });
+  })
   .get("/active", async (c) => {
     if (!coreTokenAllowed(c)) {
       return c.json({ error: "Unauthorized" }, 401);
@@ -632,6 +874,10 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
     if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
+    const coreHeaders = buildCoreHeaders(c.env);
+    if (!coreHeaders) {
+      return c.json({ error: "CORE_SERVICE_TOKEN not configured" }, 500);
+    }
 
     const userId = String(session.sub);
     try {
@@ -658,10 +904,36 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
       return c.json({ error: message }, 500);
     }
 
+    const creationEligibility = await evaluateAgentCreationEligibility({
+      env: c.env,
+      walletAddress:
+        typeof session.walletAddress === "string" ? session.walletAddress : null,
+    });
+    if (creationEligibility.enabled && !creationEligibility.eligible) {
+      const statusCode =
+        creationEligibility.code === "TOKEN_GATE_CHECK_FAILED" ||
+        creationEligibility.code === "TOKEN_GATE_MINT_NOT_CONFIGURED"
+          ? 503
+          : 409;
+      return c.json(
+        {
+          error:
+            creationEligibility.reason ||
+            "Insufficient DSRV balance for agent creation.",
+          code: creationEligibility.code || "TOKEN_GATE_INSUFFICIENT_BALANCE",
+          mint: creationEligibility.mint,
+          requiredAmount: creationEligibility.requiredAmount,
+          currentAmount: creationEligibility.currentAmount,
+          eligible: false,
+        },
+        statusCode
+      );
+    }
+
     const payload = await c.req.json().catch(() => ({}));
     const response = await fetch(`${coreUrl}/agents/start`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: coreHeaders,
       body: JSON.stringify({
         userId,
         walletAddress: session.walletAddress,
@@ -749,9 +1021,14 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
     if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
+    const coreHeaders = buildCoreHeaders(c.env, { json: false });
+    if (!coreHeaders) {
+      return c.json({ error: "CORE_SERVICE_TOKEN not configured" }, 500);
+    }
 
     const response = await fetch(`${coreUrl}/agents/${sessionId}`, {
       method: "GET",
+      headers: coreHeaders,
     });
     const data = await response.json();
     if (response.ok) {
@@ -944,6 +1221,10 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
     if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
+    const coreHeaders = buildCoreHeaders(c.env);
+    if (!coreHeaders) {
+      return c.json({ error: "CORE_SERVICE_TOKEN not configured" }, 500);
+    }
     const proposedName = await resolveProposedAgentName({
       env: c.env,
       agentId,
@@ -952,7 +1233,7 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     const response = await fetch(`${coreUrl}/agents/${agentId}/confirm`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: coreHeaders,
       body: JSON.stringify({ userId, strategyName: proposedName }),
     });
     const data = await response.json().catch(() => ({}));
@@ -1017,10 +1298,14 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
     if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
+    const coreHeaders = buildCoreHeaders(c.env);
+    if (!coreHeaders) {
+      return c.json({ error: "CORE_SERVICE_TOKEN not configured" }, 500);
+    }
 
     const coreResponse = await fetch(`${coreUrl}/agents/${agentId}`, {
       method: "DELETE",
-      headers: { "Content-Type": "application/json" },
+      headers: coreHeaders,
       body: JSON.stringify({ userId }),
     });
     if (!coreResponse.ok) {
@@ -1074,10 +1359,14 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
     if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
+    const coreHeaders = buildCoreHeaders(c.env);
+    if (!coreHeaders) {
+      return c.json({ error: "CORE_SERVICE_TOKEN not configured" }, 500);
+    }
 
     const response = await fetch(`${coreUrl}/agents/${agentId}/withdraw`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: coreHeaders,
       body: JSON.stringify({ userId, destination }),
     });
     const data = await response.json().catch(() => ({}));
@@ -1093,11 +1382,15 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
     if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
+    const coreHeaders = buildCoreHeaders(c.env);
+    if (!coreHeaders) {
+      return c.json({ error: "CORE_SERVICE_TOKEN not configured" }, 500);
+    }
 
     const payload = await c.req.json().catch(() => ({}));
     const response = await fetch(`${coreUrl}/agents/${c.req.param("id")}/submit`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: coreHeaders,
       body: JSON.stringify(payload),
     });
     const data = await response.json();
@@ -1131,12 +1424,16 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
 
     const coreUrl = c.env.CORE_URL?.replace(/\/$/, "");
     if (!coreUrl) return c.json({ error: "CORE_URL not configured" }, 500);
+    const coreHeaders = buildCoreHeaders(c.env);
+    if (!coreHeaders) {
+      return c.json({ error: "CORE_SERVICE_TOKEN not configured" }, 500);
+    }
 
     const payload = await c.req.json().catch(() => ({}));
     const payloadMessages = Array.isArray(payload.messages) ? payload.messages : [];
     const response = await fetch(`${coreUrl}/agents/${c.req.param("id")}/chat`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: coreHeaders,
       body: JSON.stringify({
         userId,
         walletAddress: session.walletAddress,
