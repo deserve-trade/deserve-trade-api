@@ -931,17 +931,46 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     }
 
     const payload = await c.req.json().catch(() => ({}));
-    const response = await fetch(`${coreUrl}/agents/start`, {
-      method: "POST",
-      headers: coreHeaders,
-      body: JSON.stringify({
-        userId,
-        walletAddress: session.walletAddress,
-        ...payload,
-      }),
-    });
+    let response: Response;
+    try {
+      response = await fetch(`${coreUrl}/agents/start`, {
+        method: "POST",
+        headers: coreHeaders,
+        body: JSON.stringify({
+          userId,
+          walletAddress: session.walletAddress,
+          ...payload,
+        }),
+      });
+    } catch (err) {
+      const detail =
+        err instanceof Error ? err.message : "Failed to reach core service.";
+      return c.json(
+        {
+          error: "Core service unavailable.",
+          code: "CORE_UNREACHABLE",
+          detail,
+        },
+        502
+      );
+    }
 
-    const data = await response.json();
+    const responseText = await response.text();
+    let data: Record<string, unknown>;
+    try {
+      data = responseText ? JSON.parse(responseText) : {};
+    } catch {
+      return c.json(
+        {
+          error: "Core returned non-JSON response.",
+          code: "CORE_INVALID_RESPONSE",
+          upstreamStatus: response.status,
+          upstreamContentType: response.headers.get("content-type") ?? null,
+          upstreamBodyPreview: responseText.slice(0, 300),
+        },
+        502
+      );
+    }
     if (response.ok) {
       const normalized = normalizeAgentStatus(data.status);
       if (data.agentId && data.sessionId) {
@@ -1089,7 +1118,7 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
     const { data: agentRow, error: agentError } = await supabase
       .from("agents")
       .select(
-        "id, name, user_id, status, network, initial_deposit_usd, current_balance_usd, current_balance_updated_at, ai_credits_remaining_percent, ai_credits_resets_in, ai_credits_updated_at, live_started_at, created_at, updated_at, status_updated_at"
+        "id, name, user_id, status, network, initial_deposit_usd, current_balance_usd, current_balance_updated_at, ai_credits_remaining_percent, ai_credits_resets_in, ai_credits_updated_at, ai_context_used_tokens, ai_context_total_tokens, ai_context_used_percent, ai_context_updated_at, live_started_at, created_at, updated_at, status_updated_at"
       )
       .eq("id", agentId)
       .maybeSingle();
@@ -1165,6 +1194,22 @@ export const agentRoutes = new Hono<{ Bindings: Bindings }>()
             ? agentRow.ai_credits_resets_in.trim()
             : null,
         aiCreditsUpdatedAt: agentRow.ai_credits_updated_at ?? null,
+        aiContextUsedTokens:
+          agentRow.ai_context_used_tokens === null ||
+          typeof agentRow.ai_context_used_tokens === "undefined"
+            ? null
+            : Number(agentRow.ai_context_used_tokens),
+        aiContextTotalTokens:
+          agentRow.ai_context_total_tokens === null ||
+          typeof agentRow.ai_context_total_tokens === "undefined"
+            ? null
+            : Number(agentRow.ai_context_total_tokens),
+        aiContextUsedPercent:
+          agentRow.ai_context_used_percent === null ||
+          typeof agentRow.ai_context_used_percent === "undefined"
+            ? null
+            : Number(agentRow.ai_context_used_percent),
+        aiContextUpdatedAt: agentRow.ai_context_updated_at ?? null,
         liveStartedAt: agentRow.live_started_at ?? null,
         createdAt: agentRow.created_at ?? null,
         statusUpdatedAt:
